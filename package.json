@@ -1,0 +1,11 @@
+{
+  "name": "carbon-cycle-root",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm --prefix Carbon-Cycle-main run dev",
+    "build": "npm --prefix Carbon-Cycle-main run build",
+    "preview": "npm --prefix Carbon-Cycle-main run preview",
+    "server": "npm --prefix Carbon-Cycle-main/backend run dev"
+  }
+}
