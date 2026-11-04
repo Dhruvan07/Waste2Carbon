@@ -1,11 +1,14 @@
 import { SEEDED_FACILITIES, SEEDED_WASTE_LOTS } from '../data/constants';
-import { Facility, PathwayType, WasteFingerprint, WasteLot, WasteStatus } from '../types';
+import { Facility, NotificationItem, PathwayType, WasteFingerprint, WasteLot, WasteStatus } from '../types';
 import { calculateBatchImpact } from './carbonCalculator';
-import { calculateHaversineDistance, evaluatePathwaySuitability, matchFacilitiesForWaste } from './recommendationEngine';
+import { calculateHaversineDistance, evaluatePathwaySuitability } from './recommendationEngine';
+import { API_BASE_URL } from './authService';
 
 const STORAGE_KEY_LOTS = 'carboncycle_waste_lots_v1';
 const STORAGE_KEY_FACILITIES = 'carboncycle_facilities_v1';
+const STORAGE_KEY_NOTIFICATIONS = 'carboncycle_notifications_v1';
 
+// Synchronous local cache helpers
 export function getStoredWasteLots(): WasteLot[] {
   try {
     const data = localStorage.getItem(STORAGE_KEY_LOTS);
@@ -42,6 +45,557 @@ export function saveStoredFacilities(facilities: Facility[]): void {
   }
 }
 
+export function getStoredNotifications(): NotificationItem[] {
+  try {
+    const data = localStorage.getItem(STORAGE_KEY_NOTIFICATIONS);
+    if (data) return JSON.parse(data);
+  } catch (e) {
+    console.error('Failed to load notifications from local storage', e);
+  }
+  return [];
+}
+
+export function saveStoredNotifications(items: NotificationItem[]): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_NOTIFICATIONS, JSON.stringify(items));
+  } catch (e) {
+    console.error('Failed to save notifications to local storage', e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ASYNC DATABASE API METHODS (PRIMARY)
+// ---------------------------------------------------------------------------
+
+export interface PincodeLocationResult {
+  success: boolean;
+  message?: string;
+  source?: string;
+  data?: {
+    areaName: string;
+    district: string;
+    state: string;
+    formattedAddress: string;
+    lat: number;
+    lng: number;
+    pincode?: string;
+  };
+}
+
+export async function lookupPincodeApi(pincode: string): Promise<PincodeLocationResult> {
+  const cleanCode = (pincode || '').replace(/\D/g, '').slice(0, 6);
+  if (!/^\d{6}$/.test(cleanCode)) {
+    return {
+      success: false,
+      message: 'PIN code must be exactly 6 digits.',
+    };
+  }
+
+  // 1. Try Backend API endpoint
+  try {
+    const res = await fetch(`${API_BASE_URL}/location/pincode/${cleanCode}`);
+    const json = await res.json();
+    if (json.success && json.data) {
+      return json;
+    }
+  } catch (error) {
+    console.warn('[Pincode API Warning]: Backend lookup failed, trying direct provider fallback.', error);
+  }
+
+  // 2. Direct client-side provider fallback (Zippopotam.us)
+  try {
+    const zippoRes = await fetch(`https://api.zippopotam.us/in/${cleanCode}`);
+    if (zippoRes.ok) {
+      const zippoJson = await zippoRes.json();
+      if (Array.isArray(zippoJson.places) && zippoJson.places.length > 0) {
+        const place = zippoJson.places[0];
+        const areaName = place['place name'] || `Sector ${cleanCode}`;
+        const state = place['state'] || 'India';
+        const lat = parseFloat(place['latitude']) || 23.0;
+        const lng = parseFloat(place['longitude']) || 72.5;
+
+        return {
+          success: true,
+          source: 'client_geocoded',
+          data: {
+            areaName,
+            district: areaName,
+            state,
+            formattedAddress: `${areaName}, ${state} - ${cleanCode}`,
+            lat: Number(lat.toFixed(4)),
+            lng: Number(lng.toFixed(4)),
+            pincode: cleanCode,
+          },
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('Zippopotam client fallback failed', err);
+  }
+
+  // 3. Direct India Post client fallback
+  try {
+    const postalRes = await fetch(`https://api.postalpincode.in/pincode/${cleanCode}`);
+    if (postalRes.ok) {
+      const postalJson = await postalRes.json();
+      if (
+        Array.isArray(postalJson) &&
+        postalJson[0]?.Status === 'Success' &&
+        Array.isArray(postalJson[0].PostOffice) &&
+        postalJson[0].PostOffice.length > 0
+      ) {
+        const po = postalJson[0].PostOffice[0];
+        return {
+          success: true,
+          source: 'client_postal',
+          data: {
+            areaName: `${po.Name} (${po.District})`,
+            district: po.District,
+            state: po.State,
+            formattedAddress: `${po.Name}, ${po.District}, ${po.State} - ${cleanCode}`,
+            lat: 23.2156,
+            lng: 72.6369,
+            pincode: cleanCode,
+          },
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('India Post client fallback failed', err);
+  }
+
+  return {
+    success: false,
+    message: `No active location found for PIN code ${cleanCode}. Please verify the 6-digit postal code.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GIS ROAD ROUTING SERVICE (OSRM + EXPRESS BACKEND)
+// ---------------------------------------------------------------------------
+
+export interface RoadRouteResult {
+  success: boolean;
+  distanceMeters: number;
+  distanceKm: number;
+  durationSeconds: number;
+  durationMinutes: number;
+  geometry: {
+    type: 'LineString';
+    coordinates: [number, number][]; // GeoJSON [longitude, latitude]
+  };
+  steps?: any[];
+  isFallback?: boolean;
+  fromCache?: boolean;
+  message?: string;
+}
+
+const clientRouteCache = new Map<string, RoadRouteResult>();
+
+/**
+ * Helper to compute straight-line fallback distance and duration
+ */
+function getHaversineFallback(sLat: number, sLng: number, dLat: number, dLng: number) {
+  const R = 6371;
+  const dLatRad = ((dLat - sLat) * Math.PI) / 180;
+  const dLngRad = ((dLng - sLng) * Math.PI) / 180;
+  const a =
+    Math.sin(dLatRad / 2) * Math.sin(dLatRad / 2) +
+    Math.cos((sLat * Math.PI) / 180) *
+      Math.cos((dLat * Math.PI) / 180) *
+      Math.sin(dLngRad / 2) *
+      Math.sin(dLngRad / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const dist = Math.max(1, Math.round(R * c * 10) / 10);
+  const mins = Math.max(5, Math.round((dist / 35) * 60));
+  return { dist, mins };
+}
+
+/**
+ * Fetches real driving road route using CarbonCycle Express backend -> OSRM
+ */
+export async function fetchRoadRouteApi(
+  sourceLat: number,
+  sourceLng: number,
+  destinationLat: number,
+  destinationLng: number
+): Promise<RoadRouteResult> {
+  const cacheKey = `${sourceLat.toFixed(5)},${sourceLng.toFixed(5)}->${destinationLat.toFixed(5)},${destinationLng.toFixed(5)}`;
+  const cached = clientRouteCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  // 1. Try CarbonCycle Express Backend (/api/routes/route)
+  try {
+    const url = `${API_BASE_URL}/routes/route?sourceLat=${sourceLat}&sourceLng=${sourceLng}&destinationLat=${destinationLat}&destinationLng=${destinationLng}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data: RoadRouteResult = await res.json();
+      if (data.success && data.geometry?.coordinates?.length) {
+        clientRouteCache.set(cacheKey, data);
+        return data;
+      }
+    }
+  } catch (backendErr) {
+    console.warn('[Routing Warning]: Backend routing failed, attempting direct OSRM fallback', backendErr);
+  }
+
+  // 2. Client-side direct OSRM fallback if backend is unreachable
+  try {
+    const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${sourceLng},${sourceLat};${destinationLng},${destinationLat}?overview=full&geometries=geojson&steps=true&alternatives=false`;
+    const osrmRes = await fetch(osrmUrl);
+    if (osrmRes.ok) {
+      const osrmData = await osrmRes.json();
+      if (osrmData.code === 'Ok' && osrmData.routes && osrmData.routes.length > 0) {
+        const route = osrmData.routes[0];
+        const result: RoadRouteResult = {
+          success: true,
+          distanceMeters: Math.round(route.distance),
+          distanceKm: Number((route.distance / 1000).toFixed(1)),
+          durationSeconds: Math.round(route.duration),
+          durationMinutes: Math.max(1, Math.round(route.duration / 60)),
+          geometry: route.geometry,
+          steps: route.legs?.[0]?.steps || [],
+          isFallback: false,
+        };
+        clientRouteCache.set(cacheKey, result);
+        return result;
+      }
+    }
+  } catch (clientErr) {
+    console.warn('[Routing Warning]: Direct OSRM fallback failed', clientErr);
+  }
+
+  // 3. Graceful Straight-Line Fallback
+  const fallback = getHaversineFallback(sourceLat, sourceLng, destinationLat, destinationLng);
+  const fallbackResult: RoadRouteResult = {
+    success: true,
+    distanceMeters: Math.round(fallback.dist * 1000),
+    distanceKm: fallback.dist,
+    durationSeconds: fallback.mins * 60,
+    durationMinutes: fallback.mins,
+    geometry: {
+      type: 'LineString',
+      coordinates: [
+        [sourceLng, sourceLat],
+        [destinationLng, destinationLat],
+      ],
+    },
+    steps: [],
+    isFallback: true,
+    message: 'Road route unavailable — showing direct estimate',
+  };
+  return fallbackResult;
+}
+
+export async function fetchWasteLotsApi(): Promise<WasteLot[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/waste-lots`);
+    const json = await res.json();
+    if (json.success && Array.isArray(json.lots)) {
+      saveStoredWasteLots(json.lots);
+      return json.lots;
+    }
+  } catch (error) {
+    console.warn('[Store API Warning]: Failed to fetch waste lots from server, using cached data.', error);
+  }
+  return getStoredWasteLots();
+}
+
+export async function fetchFacilitiesApi(): Promise<Facility[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/facilities`);
+    const json = await res.json();
+    if (json.success && Array.isArray(json.facilities)) {
+      saveStoredFacilities(json.facilities);
+      return json.facilities;
+    }
+  } catch (error) {
+    console.warn('[Store API Warning]: Failed to fetch facilities from server, using cached data.', error);
+  }
+  return getStoredFacilities();
+}
+
+export async function updateFacilityApi(
+  facilityId: string,
+  updates: Partial<Facility>
+): Promise<Facility | null> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/facilities/${facilityId}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(updates),
+    });
+
+    const json = await res.json();
+    if (json.success && json.facility) {
+      const current = getStoredFacilities();
+      const updated = current.map((f) => (f.id === facilityId ? json.facility : f));
+      saveStoredFacilities(updated);
+      return json.facility;
+    }
+  } catch (error) {
+    console.warn('[Store API Warning]: Failed to update facility on server, falling back to local.', error);
+  }
+  const current = getStoredFacilities();
+  const index = current.findIndex((f) => f.id === facilityId);
+  if (index !== -1) {
+    current[index] = { ...current[index], ...updates };
+    saveStoredFacilities(current);
+    return current[index];
+  }
+  return null;
+}
+
+export async function createWasteLotApi(
+  generatorName: string,
+  generatorType: string,
+  fingerprint: WasteFingerprint
+): Promise<WasteLot> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    let storedUser: any = null;
+    try {
+      const raw = localStorage.getItem('carboncycle_auth_user_v1');
+      if (raw) storedUser = JSON.parse(raw);
+    } catch (e) {}
+
+    const res = await fetch(`${API_BASE_URL}/waste-lots`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        generatorName: generatorName || storedUser?.organizationName || storedUser?.name,
+        generatorType: generatorType || storedUser?.organizationType,
+        generatorId: storedUser?.id || storedUser?._id,
+        generatorContact: storedUser?.email,
+        fingerprint,
+      }),
+    });
+
+    const json = await res.json();
+    if (json.success && json.lot) {
+      const current = getStoredWasteLots();
+      saveStoredWasteLots([json.lot, ...current.filter((l) => l.id !== json.lot.id)]);
+      return json.lot;
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to create waste lot on server, falling back to local.', error);
+  }
+  return createNewWasteLot(generatorName, generatorType, fingerprint);
+}
+
+export async function matchAndSelectFacilityApi(
+  lotId: string,
+  facilityId: string
+): Promise<WasteLot | null> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/waste-lots/${lotId}/match`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ facilityId }),
+    });
+
+    const json = await res.json();
+    if (json.success && json.lot) {
+      const current = getStoredWasteLots();
+      const updated = current.map((l) => (l.id === lotId ? json.lot : l));
+      saveStoredWasteLots(updated);
+      return json.lot;
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to match facility on server, falling back to local.', error);
+  }
+  return matchAndSelectFacilityForLot(lotId, facilityId);
+}
+
+// Alias for readability
+export const requestFacilityMatchApi = matchAndSelectFacilityApi;
+
+export async function respondToMatchRequestApi(
+  lotId: string,
+  action: 'ACCEPT' | 'REJECT',
+  rejectionReason?: string,
+  facilityId?: string
+): Promise<WasteLot | null> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/waste-lots/${lotId}/respond-match`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ action, rejectionReason, facilityId }),
+    });
+
+    const json = await res.json();
+    if (json.success && json.lot) {
+      const current = getStoredWasteLots();
+      const updated = current.map((l) => (l.id === lotId ? json.lot : l));
+      saveStoredWasteLots(updated);
+      return json.lot;
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to respond to match request on server, falling back to local.', error);
+  }
+  return respondToMatchRequestForLot(lotId, action, rejectionReason);
+}
+
+export async function notifyGateArrivalApi(
+  lotId: string
+): Promise<WasteLot | null> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/waste-lots/${lotId}/gate-arrival`, {
+      method: 'PUT',
+      headers,
+    });
+
+    const json = await res.json();
+    if (json.success && json.lot) {
+      const current = getStoredWasteLots();
+      const updated = current.map((l) => (l.id === lotId ? json.lot : l));
+      saveStoredWasteLots(updated);
+      return json.lot;
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to notify gate arrival on server, falling back to local.', error);
+  }
+  return notifyGateArrivalForLot(lotId);
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFICATIONS API
+// ---------------------------------------------------------------------------
+
+export async function fetchNotificationsApi(params?: {
+  role?: string;
+  email?: string;
+  facilityId?: string;
+}): Promise<NotificationItem[]> {
+  try {
+    const query = new URLSearchParams();
+    if (params?.role) query.append('role', params.role);
+    if (params?.email) query.append('email', params.email);
+    if (params?.facilityId) query.append('facilityId', params.facilityId);
+
+    const res = await fetch(`${API_BASE_URL}/notifications?${query.toString()}`);
+    const json = await res.json();
+    if (json.success && Array.isArray(json.notifications)) {
+      saveStoredNotifications(json.notifications);
+      return json.notifications;
+    }
+  } catch (error) {
+    console.warn('[Notifications API Warning]: Failed to fetch notifications from server, using cached.', error);
+  }
+  return getStoredNotifications();
+}
+
+export async function markNotificationReadApi(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/notifications/${id}/read`, { method: 'PUT' });
+    const json = await res.json();
+    if (json.success) {
+      const current = getStoredNotifications();
+      saveStoredNotifications(current.map((n) => (n.id === id ? { ...n, read: true } : n)));
+      return true;
+    }
+  } catch (error) {
+    console.error('[Notifications API Error]: Failed to mark notification read on server.', error);
+  }
+  const current = getStoredNotifications();
+  saveStoredNotifications(current.map((n) => (n.id === id ? { ...n, read: true } : n)));
+  return true;
+}
+
+export async function markAllNotificationsReadApi(params?: {
+  role?: string;
+  email?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/notifications/read-all`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params || {}),
+    });
+    const json = await res.json();
+    if (json.success) {
+      const current = getStoredNotifications();
+      saveStoredNotifications(current.map((n) => ({ ...n, read: true })));
+      return true;
+    }
+  } catch (error) {
+    console.error('[Notifications API Error]: Failed to mark all notifications read on server.', error);
+  }
+  const current = getStoredNotifications();
+  saveStoredNotifications(current.map((n) => ({ ...n, read: true })));
+  return true;
+}
+
+export async function updateLotLifecycleStatusApi(
+  lotId: string,
+  newStatus: WasteStatus,
+  customNote?: string
+): Promise<WasteLot | null> {
+  try {
+    const token = localStorage.getItem('carboncycle_auth_token_v1');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/waste-lots/${lotId}/status`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ status: newStatus, note: customNote }),
+    });
+
+    const json = await res.json();
+    if (json.success && json.lot) {
+      const current = getStoredWasteLots();
+      const updated = current.map((l) => (l.id === lotId ? json.lot : l));
+      saveStoredWasteLots(updated);
+      return json.lot;
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to update lot status on server, falling back to local.', error);
+  }
+  // Fallback to local lifecycle update
+  return updateLotLifecycleStatus(lotId, newStatus, customNote);
+}
+
+export async function resetDemoDataApi(): Promise<{ lots: WasteLot[]; facilities: Facility[] }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/waste-lots/reset`, { method: 'POST' });
+    const json = await res.json();
+    if (json.success && Array.isArray(json.lots) && Array.isArray(json.facilities)) {
+      saveStoredWasteLots(json.lots);
+      saveStoredFacilities(json.facilities);
+      return { lots: json.lots, facilities: json.facilities };
+    }
+  } catch (error) {
+    console.error('[Store API Error]: Failed to reset database on server, falling back to local.', error);
+  }
+  return resetDemoData();
+}
+
+// ---------------------------------------------------------------------------
+// SYNCHRONOUS FALLBACK / LOCAL CREATION METHODS
+// ---------------------------------------------------------------------------
+
 export function resetDemoData(): { lots: WasteLot[]; facilities: Facility[] } {
   localStorage.removeItem(STORAGE_KEY_LOTS);
   localStorage.removeItem(STORAGE_KEY_FACILITIES);
@@ -66,25 +620,39 @@ export function createNewWasteLot(
   const now = new Date();
   const dateStr = now.toISOString().replace('T', ' ').slice(0, 16);
 
+  let storedUser: any = null;
+  try {
+    const raw = localStorage.getItem('carboncycle_auth_user_v1');
+    if (raw) storedUser = JSON.parse(raw);
+  } catch (e) {}
+
+  const finalName = generatorName || storedUser?.organizationName || storedUser?.name || 'Regional Agro Source';
+  const finalType = generatorType || storedUser?.organizationType || 'Agricultural Enterprise';
+
+  const initialImpact = calculateBatchImpact(fingerprint, recommendedPathway, 15);
+
   const newLot: WasteLot = {
     id: newId,
     createdAt: now.toISOString(),
-    generatorName: generatorName || 'Regional Agro Source',
-    generatorType: generatorType || 'Agricultural Enterprise',
+    generatorId: storedUser?.id || storedUser?._id,
+    generatorContact: storedUser?.email,
+    generatorName: finalName,
+    generatorType: finalType,
     fingerprint,
     status: 'LISTED',
     selectedPathway: recommendedPathway,
+    impactMetrics: initialImpact,
     timeline: [
       {
         status: 'LISTED',
         timestamp: dateStr,
-        note: `Waste batch listed by ${generatorName || 'Generator'}`,
+        note: `Waste batch listed by ${finalName}`,
       },
       {
         status: 'ANALYZED',
         timestamp: dateStr,
         note: `Fingerprint generated. Recommended pathway: ${recommendedPathway}`,
-      }
+      },
     ],
   };
 
@@ -138,8 +706,16 @@ export function matchAndSelectFacilityForLot(
   lot.impactMetrics = impact;
 
   lot.processingYield = {
-    outputType: pathway === 'BIOCHAR' ? 'Biochar & Process Heat' : pathway === 'BIOGAS' ? 'Biomethane (CBG) & Bio-slurry' : 'Organic Soil Amendment',
-    outputQuantity: pathway === 'BIOCHAR' ? `${(lot.fingerprint.quantityTonnes * 0.35).toFixed(1)} tonnes Biochar` : `${Math.round(lot.fingerprint.quantityTonnes * 80)} m³ Biogas`,
+    outputType:
+      pathway === 'BIOCHAR'
+        ? 'Biochar & Process Heat'
+        : pathway === 'BIOGAS'
+        ? 'Biomethane (CBG) & Bio-slurry'
+        : 'Organic Soil Amendment',
+    outputQuantity:
+      pathway === 'BIOCHAR'
+        ? `${(lot.fingerprint.quantityTonnes * 0.35).toFixed(1)} tonnes Biochar`
+        : `${Math.round(lot.fingerprint.quantityTonnes * 80)} m³ Biogas`,
     progressPercent: 0,
     startedAt: 'Pending Arrival',
     estimatedCompletionAt: '24h post-delivery',
@@ -187,12 +763,70 @@ export function updateLotLifecycleStatus(
     }
   }
 
+  const lastEntry = lot.timeline[lot.timeline.length - 1];
+  if (!lastEntry || lastEntry.status !== newStatus) {
+    lot.timeline.push({
+      status: newStatus,
+      timestamp: dateStr,
+      note: customNote || defaultNote,
+    });
+  }
+
+  saveStoredWasteLots(lots);
+  return lot;
+}
+
+export function respondToMatchRequestForLot(
+  lotId: string,
+  action: 'ACCEPT' | 'REJECT',
+  rejectionReason?: string
+): WasteLot | null {
+  const lots = getStoredWasteLots();
+  const lotIndex = lots.findIndex((l) => l.id === lotId);
+  if (lotIndex === -1) return null;
+
+  const lot = lots[lotIndex];
+  const dateStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
+
+  if (action === 'ACCEPT') {
+    lot.status = 'MATCHED';
+    lot.matchedFacilityId = lot.requestedFacilityId || lot.matchedFacilityId;
+    lot.matchedFacilityName = lot.requestedFacilityName || lot.matchedFacilityName;
+    lot.timeline.push({
+      status: 'MATCHED',
+      timestamp: dateStr,
+      note: `Facility intake accepted by ${lot.matchedFacilityName}. Collection scheduled.`,
+    });
+  } else {
+    lot.status = 'REJECTED';
+    lot.rejectionReason = rejectionReason || 'Capacity constraints';
+    lot.timeline.push({
+      status: 'REJECTED',
+      timestamp: dateStr,
+      note: `Intake rejected: ${lot.rejectionReason}`,
+    });
+  }
+
+  saveStoredWasteLots(lots);
+  return lot;
+}
+
+export function notifyGateArrivalForLot(lotId: string): WasteLot | null {
+  const lots = getStoredWasteLots();
+  const lotIndex = lots.findIndex((l) => l.id === lotId);
+  if (lotIndex === -1) return null;
+
+  const lot = lots[lotIndex];
+  const dateStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
+  lot.status = 'AT_GATE';
+  lot.gateArrivalTime = new Date().toISOString();
   lot.timeline.push({
-    status: newStatus,
+    status: 'AT_GATE',
     timestamp: dateStr,
-    note: customNote || defaultNote,
+    note: 'Truck arrived at facility intake gate. Queued for weighbridge check-in.',
   });
 
   saveStoredWasteLots(lots);
   return lot;
 }
+

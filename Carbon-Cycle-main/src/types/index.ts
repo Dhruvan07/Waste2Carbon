@@ -14,9 +14,12 @@ export type PathwayType =
 export type WasteStatus = 
   | 'LISTED'
   | 'ANALYZED'
+  | 'MATCH_REQUESTED'
   | 'MATCHED'
+  | 'REJECTED'
   | 'PICKUP'
   | 'IN_TRANSIT'
+  | 'AT_GATE'
   | 'DELIVERED'
   | 'PROCESSING'
   | 'COMPLETED';
@@ -50,9 +53,10 @@ export interface Facility {
   processingCostPerTon: number;
   carbonFactorPerTon: number;
   rating: number;
-  contactEmail: string;
+  contactEmail?: string;
   activeBatchesCount: number;
   status: 'ACTIVE' | 'FULL' | 'MAINTENANCE';
+  operatorId?: string;
 }
 
 export interface PathwaySuitability {
@@ -127,14 +131,38 @@ export interface ProcessingYield {
   estimatedCompletionAt: string;
 }
 
+export interface RequestedFacilityEntry {
+  facilityId: string;
+  facilityName: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'SUPERSEDED';
+  requestedAt: string;
+  rejectionReason?: string;
+}
+
+export interface FacilityRegistrationProfile {
+  name?: string;
+  type: PathwayType;
+  maxCapacityTonnes: number;
+  processingCostPerTon: number;
+  acceptedWasteTypes: WasteType[];
+  location?: LocationPoint;
+}
+
 export interface WasteLot {
   id: string; // e.g. W2C-2026-00125
   createdAt: string;
+  generatorId?: string;
+  generatorContact?: string;
   generatorName: string;
   generatorType: string;
   fingerprint: WasteFingerprint;
   status: WasteStatus;
   selectedPathway?: PathwayType;
+  requestedFacilityId?: string;
+  requestedFacilityName?: string;
+  requestedFacilities?: RequestedFacilityEntry[];
+  rejectionReason?: string;
+  gateArrivalTime?: string;
   matchedFacilityId?: string;
   matchedFacilityName?: string;
   matchedFacilityType?: PathwayType;
@@ -143,6 +171,22 @@ export interface WasteLot {
   logistics?: LogisticsInfo;
   impactMetrics?: ImpactMetrics;
   processingYield?: ProcessingYield;
+}
+
+export interface NotificationItem {
+  id: string;
+  recipientRole?: 'ALL' | 'WASTE_GENERATOR' | 'FACILITY_OPERATOR';
+  recipientEmail?: string;
+  facilityId?: string;
+  lotId?: string;
+  lotDisplayId?: string;
+  title: string;
+  message: string;
+  type: 'INTAKE_REQUEST' | 'REQUEST_ACCEPTED' | 'REQUEST_REJECTED' | 'GATE_ARRIVAL' | 'STATUS_CHANGE' | 'SYSTEM';
+  read: boolean;
+  actionTab?: string;
+  metadata?: Record<string, any>;
+  createdAt: string;
 }
 
 export interface EmissionFactors {

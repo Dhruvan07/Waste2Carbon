@@ -1,3 +1,9 @@
+import { FacilityRegistrationProfile } from '../types';
+import { API_URL, API_BASE_URL, API_ENDPOINTS, checkHealthApi, HealthResponse } from './api';
+
+export { API_URL, API_BASE_URL, API_ENDPOINTS, checkHealthApi };
+export type { HealthResponse };
+
 export interface AuthUser {
   id: string;
   name: string;
@@ -16,8 +22,16 @@ export interface AuthResponse {
   user?: AuthUser;
 }
 
-const API_BASE_URL = 'http://localhost:5000/api';
+export interface AdminUsersResponse {
+  success: boolean;
+  users?: AuthUser[];
+  message?: string;
+}
 
+/**
+ * POST /api/auth/register
+ * Registers a new account with the backend
+ */
 export async function registerApi(data: {
   name: string;
   email: string;
@@ -26,9 +40,10 @@ export async function registerApi(data: {
   organizationType?: string;
   location?: string;
   role?: string;
+  facilityProfile?: FacilityRegistrationProfile;
 }): Promise<AuthResponse> {
   try {
-    const res = await fetch(`${API_BASE_URL}/auth/register`, {
+    const res = await fetch(API_ENDPOINTS.AUTH_REGISTER, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -40,28 +55,21 @@ export async function registerApi(data: {
     }
     return json;
   } catch (err: any) {
-    console.warn('[Auth Service Warning]: Backend unavailable, using client session fallback.');
-    const assignedRole = data.role === 'facility_operator' ? 'facility_operator' : 'generator';
-    const mockUser: AuthUser = {
-      id: `usr-${Date.now()}`,
-      name: data.name,
-      email: data.email.toLowerCase(),
-      role: assignedRole,
-      organizationName: data.organizationName,
-      organizationType: data.organizationType || (assignedRole === 'facility_operator' ? 'Conversion Facility Operator' : 'Agricultural Enterprise'),
-      location: data.location || 'Gandhinagar, Gujarat',
-    };
+    console.error('[Auth Service Error]: Registration failed due to network/server connection error:', err);
     return {
-      success: true,
-      token: `demo_jwt_token_${Date.now()}`,
-      user: mockUser,
+      success: false,
+      message: 'Unable to connect to authentication server. Please check your connection or backend API URL.',
     };
   }
 }
 
+/**
+ * POST /api/auth/login
+ * Authenticates user credentials with the backend
+ */
 export async function loginApi(data: { email: string; password: string }): Promise<AuthResponse> {
   try {
-    const res = await fetch(`${API_BASE_URL}/auth/login`, {
+    const res = await fetch(API_ENDPOINTS.AUTH_LOGIN, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -69,36 +77,25 @@ export async function loginApi(data: { email: string; password: string }): Promi
 
     const json = await res.json();
     if (!res.ok) {
-      return { success: false, message: json.message || 'Invalid credentials' };
+      return { success: false, message: json.message || 'Invalid email or password' };
     }
     return json;
   } catch (err: any) {
-    console.warn('[Auth Service Warning]: Backend unavailable, using client session fallback.');
-    const isAdmin = data.email.includes('admin');
-    const isFacility = data.email.includes('facility');
-
-    const role: AuthUser['role'] = isAdmin ? 'admin' : isFacility ? 'facility_operator' : 'generator';
-
-    const mockUser: AuthUser = {
-      id: isAdmin ? 'usr-admin-001' : isFacility ? 'usr-fac-001' : 'usr-gen-001',
-      name: isAdmin ? 'Admin Controller' : isFacility ? 'Suresh Kumar' : 'Vaibhav Patel',
-      email: data.email.toLowerCase(),
-      role,
-      organizationName: isAdmin ? 'CarbonCycle Admin' : isFacility ? 'Gujarat EcoChar Pyrolysis Center' : 'Gandhinagar Farmers Co-op',
-      organizationType: isAdmin ? 'Network Administrator' : isFacility ? 'Conversion Facility Operator' : 'Agricultural Enterprise',
-      location: 'Gandhinagar, Gujarat',
-    };
+    console.error('[Auth Service Error]: Login failed due to network/server connection error:', err);
     return {
-      success: true,
-      token: `demo_jwt_token_${Date.now()}`,
-      user: mockUser,
+      success: false,
+      message: 'Unable to connect to authentication server. Please check your connection or backend API URL.',
     };
   }
 }
 
+/**
+ * GET /api/auth/me
+ * Retrieves current authenticated user session using JWT token
+ */
 export async function getMeApi(token: string): Promise<AuthResponse> {
   try {
-    const res = await fetch(`${API_BASE_URL}/auth/me`, {
+    const res = await fetch(API_ENDPOINTS.AUTH_ME, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -112,6 +109,32 @@ export async function getMeApi(token: string): Promise<AuthResponse> {
     }
     return json;
   } catch (err) {
+    console.error('[Auth Service Error]: Failed to reach server during session restoration:', err);
     return { success: false, message: 'Server unreachable' };
+  }
+}
+
+/**
+ * GET /api/admin/users
+ * Fetches all registered users (admin privilege required)
+ */
+export async function getAdminUsersApi(token: string): Promise<AdminUsersResponse> {
+  try {
+    const res = await fetch(API_ENDPOINTS.ADMIN_USERS, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    const json = await res.json();
+    if (!res.ok) {
+      return { success: false, message: json.message || 'Failed to fetch users' };
+    }
+    return json;
+  } catch (err: any) {
+    console.warn('[Admin API Warning]: Unable to connect to admin users endpoint', err);
+    return { success: false, message: err.message || 'Server unreachable' };
   }
 }

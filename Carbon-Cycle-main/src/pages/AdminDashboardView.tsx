@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Facility, WasteLot } from '../types';
-import { AuthUser } from '../services/authService';
+import { AuthUser, getAdminUsersApi, checkHealthApi, API_URL } from '../services/authService';
 import { DisclaimerBanner } from '../components/common/DisclaimerBanner';
-import { ShieldCheck, Users, Factory, Trash2, Leaf, Settings, CheckCircle2, ChevronRight, BarChart3, Database, Key } from 'lucide-react';
+import { ShieldCheck, Users, Factory, Trash2, Leaf, Settings, CheckCircle2, ChevronRight, BarChart3, Database, Key, Server, Activity } from 'lucide-react';
 import { DEFAULT_EMISSION_FACTORS } from '../data/constants';
 
 interface AdminDashboardViewProps {
@@ -14,20 +14,35 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ wasteLot
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [activeTab, setActiveTab] = useState<'USERS' | 'GENERATORS' | 'FACILITIES' | 'SYSTEM_DATA'>('USERS');
   const [loadingUsers, setLoadingUsers] = useState(true);
+  const [backendHealth, setBackendHealth] = useState<{
+    status: 'checking' | 'healthy' | 'error';
+    message?: string;
+    timestamp?: string;
+  }>({ status: 'checking' });
 
-  // Fetch all registered users from /api/admin/users
+  // Fetch all registered users from /api/admin/users and verify /api/health
   useEffect(() => {
-    async function fetchUsers() {
+    async function initAdminData() {
+      // 1. Health check via GET /api/health
+      try {
+        const health = await checkHealthApi();
+        if (health.success) {
+          setBackendHealth({ status: 'healthy', message: health.message, timestamp: health.timestamp });
+        } else {
+          setBackendHealth({ status: 'error', message: health.message });
+        }
+      } catch (err: any) {
+        setBackendHealth({ status: 'error', message: err.message });
+      }
+
+      // 2. Fetch registered users via GET /api/admin/users
       try {
         const token = localStorage.getItem('carboncycle_auth_token_v1');
-        const res = await fetch('http://localhost:5000/api/admin/users', {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-        const json = await res.json();
-        if (json.success && json.users) {
-          setUsers(json.users);
+        if (token) {
+          const res = await getAdminUsersApi(token);
+          if (res.success && res.users) {
+            setUsers(res.users);
+          }
         }
       } catch (err) {
         console.warn('Failed to fetch admin user list', err);
@@ -35,7 +50,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ wasteLot
         setLoadingUsers(false);
       }
     }
-    fetchUsers();
+    initAdminData();
   }, []);
 
   // Compute System-Wide Generator Aggregates
@@ -68,9 +83,35 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ wasteLot
             </p>
           </div>
         </div>
-      </div>
 
-      <DisclaimerBanner />
+        {/* Live Backend Connection Indicator */}
+        <div className="flex flex-col sm:items-end gap-1 text-xs">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-gray-300">Target Backend:</span>
+            <code className="text-[11px] bg-black/40 px-2 py-0.5 rounded text-gray-200 border border-white/10 font-mono">
+              {API_URL}
+            </code>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-semibold border ${
+              backendHealth.status === 'healthy'
+                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                : backendHealth.status === 'checking'
+                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                backendHealth.status === 'healthy' ? 'bg-emerald-400 animate-pulse' : backendHealth.status === 'checking' ? 'bg-amber-400' : 'bg-rose-400'
+              }`} />
+              {backendHealth.status === 'healthy'
+                ? 'Backend Online (/api/health)'
+                : backendHealth.status === 'checking'
+                ? 'Checking /api/health...'
+                : 'Backend Offline'}
+            </span>
+          </div>
+        </div>
+      </div>
 
       {/* Admin Macro KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -315,6 +356,41 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ wasteLot
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
             
+            <div className="p-4 bg-surface-muted/40 rounded-btn border border-border space-y-2 md:col-span-2">
+              <div className="flex items-center justify-between border-b border-border pb-2">
+                <div className="flex items-center gap-2">
+                  <Server className="w-4 h-4 text-brand-primary" />
+                  <h3 className="font-bold text-carbon-primary">Backend API & Cloud Connectivity</h3>
+                </div>
+                <span className={`px-2.5 py-0.5 rounded text-[10px] font-bold uppercase border ${
+                  backendHealth.status === 'healthy'
+                    ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                    : backendHealth.status === 'checking'
+                    ? 'bg-amber-100 text-amber-800 border-amber-300'
+                    : 'bg-rose-100 text-rose-800 border-rose-300'
+                }`}>
+                  {backendHealth.status === 'healthy' ? 'Active & Reachable' : backendHealth.status === 'checking' ? 'Connecting...' : 'Unreachable'}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 text-[11px]">
+                <div>
+                  <span className="text-carbon-muted block">Target Backend Host:</span>
+                  <span className="font-mono font-semibold text-carbon-primary break-all">{API_URL}</span>
+                </div>
+                <div>
+                  <span className="text-carbon-muted block">Health Endpoint (GET):</span>
+                  <span className="font-mono font-semibold text-carbon-primary">{API_URL}/api/health</span>
+                </div>
+                <div>
+                  <span className="text-carbon-muted block">Backend Health Status:</span>
+                  <span className="font-semibold text-carbon-primary">{backendHealth.message || 'Connecting...'}</span>
+                  {backendHealth.timestamp && (
+                    <span className="text-[10px] text-carbon-muted block font-mono">Synced: {backendHealth.timestamp}</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
             <div className="p-4 bg-surface-muted/40 rounded-btn border border-border space-y-2">
               <h3 className="font-bold text-carbon-primary border-b border-border pb-1">Landfill Avoidance Factors</h3>
               <p className="text-[11px] text-carbon-secondary">tCO₂e avoided per ton diverted from open dumps</p>
